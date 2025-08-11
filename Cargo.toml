@@ -31,7 +31,7 @@ solana-logger = { version = "2.3.1" }
 solana-measure = { version = "2.3.6" }
 solana-metrics = { version = "2.3.6" }
 solana-runtime = { version = "2.3.6" }
-solana-program = { version = "2.3.6" }
+solana-program = { version = "2.3.0" }
 solana-zk-token-sdk = { version = "2.3.6" } 
 solana-sdk = { version = "2.3.6" }
 solana-transaction-status = { version = "2.3.6" }
