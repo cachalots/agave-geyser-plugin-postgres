@@ -56,10 +56,10 @@ tempfile = "3.13.0"
 targets = ["x86_64-unknown-linux-gnu"]
 
 
-[patch.crates-io]
-curve25519-dalek = { git = "https://github.com/anza-xyz/curve25519-dalek.git", rev = "b500cdc2a920cd5bff9e2dd974d7b97349d61464" }
+#[patch.crates-io]
+#curve25519-dalek = { git = "https://github.com/anza-xyz/curve25519-dalek.git", rev = "b500cdc2a920cd5bff9e2dd974d7b97349d61464" }
 
-solana-curve25519 = { version = "2.3.6" }
-solana-program = { version = "2.3.6" }
-solana-zk-sdk = { version = "2.3.6" }
-solana-zk-token-sdk = { version = "2.3.6" }
+#solana-curve25519 = { version = "2.3.6" }
+#solana-program = { version = "2.3.6" }
+#solana-zk-sdk = { version = "2.3.6" }
+#solana-zk-token-sdk = { version = "2.3.6" }
