@@ -266,7 +266,7 @@ impl GeyserPlugin for AccountsDbPluginPostgres {
                 )));
             }
             Some(client) => {
-                let result = client.update_slot_status(slot, parent, status);
+                let result = client.update_slot_status(slot, parent, status.clone());
 
                 if let Err(err) = result {
                     return Err(GeyserPluginError::SlotStatusUpdateError{
