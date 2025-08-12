@@ -254,7 +254,7 @@ impl GeyserPlugin for AccountsDbPluginPostgres {
         Ok(())
     }
 
-    fn update_slot_status(&self, slot: u64, parent: Option<u64>, status: SlotStatus) -> Result<()> {
+    fn update_slot_status(&self, slot: u64, parent: Option<u64>, status: &SlotStatus) -> Result<()> {
         info!("Updating slot {:?} at with status {:?}", slot, status);
 
         match &self.client {
