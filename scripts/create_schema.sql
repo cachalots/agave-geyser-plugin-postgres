@@ -68,7 +68,8 @@ Create TYPE "TransactionErrorCode" AS ENUM (
     'ResanitizationNeeded',
     'ProgramExecutionTemporarilyRestricted',
     'UnbalancedTransaction',
-    'ProgramCacheHitMaxLimit'
+    'ProgramCacheHitMaxLimit',
+    'CommitCancelled'
 );
 
 CREATE TYPE "TransactionError" AS (

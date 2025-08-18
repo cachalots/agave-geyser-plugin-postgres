@@ -41,6 +41,7 @@ thiserror = "1.0.64"
 tokio-postgres = "0.7.12"
 
 [dev-dependencies]
+agave-reserved-account-keys = { version = "2.3.6" }
 libc = "0.2.112"
 libloading = "0.7.2"
 serial_test = "0.5.1"
@@ -49,7 +50,8 @@ solana-core = { version = "2.3.6" }
 solana-local-cluster = { version = "2.3.6" }
 solana-net-utils = { version = "2.3.6" }
 solana-rpc = { version = "2.3.6" }
-solana-streamer= { version = "2.3.6" }
+solana-streamer = { version = "2.3.6" }
+solana-system-transaction = { version = "2.2.1" } 
 tempfile = "3.13.0"
 
 [package.metadata.docs.rs]
