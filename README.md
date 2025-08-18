@@ -1,6 +1,6 @@
-The `solana-geyser-plugin-postgres` crate implements a plugin storing
+The `solana-accountsdb-plugin-postgres` crate implements a plugin storing
 account data to a PostgreSQL database to illustrate how a plugin can be
-developed to work with Solana validators using the [Plugin Framework](https://docs.solana.com/developing/plugins/geyser-plugins).
+developed to work with Solana validators using the [Plugin Framework](https://docs.solana.com/developing/plugins/accountsdb_plugin).
 
 ### Configuration File Format
 
@@ -9,7 +9,7 @@ configuration file looks like the following:
 
 ```
 {
-	"libpath": "/solana/target/release/libsolana_geyser_plugin_postgres.so",
+	"libpath": "/solana/target/release/libsolana_accountsdb_plugin_postgres.so",
 	"host": "postgres-server",
 	"user": "solana",
 	"port": 5433,
@@ -196,7 +196,7 @@ Use the scripts/create_schema.sql
 psql -U solana -p 5433 -h 10.138.0.9 -w -d solana -f scripts/create_schema.sql
 ```
 
-After this, start the validator with the plugin by using the `--geyser-plugin-config`
+After this, start the validator with the plugin by using the `--accountsdb-plugin-config`
 argument mentioned above.
 
 #### Destroy the Schema Objects
@@ -267,13 +267,13 @@ The following are the tables in the Postgres database
 
 ### Performance Considerations
 
-When a validator lacks sufficient computing power, the overhead of saving the
+When a validator lacks sufficient compute power, the overhead of saving the
 account data can cause it to fall behind the network especially when all
 accounts or a large number of accounts are selected. The node hosting the
-PostgreSQL database needs to be powerful enough to handle the database loads
+PostgreSQL database need to be powerful enough to handle the database loads
 as well. It has been found using GCP n2-standard-64 machine type for the
 validator and n2-highmem-32 for the PostgreSQL node is adequate for handling
-transmitting all accounts while keeping up with the network. In addition, it is
+transmiting all accounts while keeping up with the network. In addition, it is
 best to keep the validator and the PostgreSQL in the same local network to
 reduce latency. You may need to size the validator and database nodes
 differently if serving other loads.

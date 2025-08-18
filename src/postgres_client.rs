@@ -1,14 +1,15 @@
-#![allow(clippy::arithmetic_side_effects)]
+#![allow(clippy::integer_arithmetic)]
 
-mod postgres_client_account_index;
 mod postgres_client_block_metadata;
 mod postgres_client_transaction;
 
 /// A concurrent implementation for writing accounts into the PostgreSQL in parallel.
 use {
-    crate::{
-        geyser_plugin_postgres::{GeyserPluginPostgresConfig, GeyserPluginPostgresError},
-        postgres_client::postgres_client_account_index::TokenSecondaryIndexEntry,
+    crate::accountsdb_plugin_postgres::{
+        AccountsDbPluginPostgresConfig, AccountsDbPluginPostgresError,
+    },
+    agave_geyser_plugin_interface::geyser_plugin_interface::{
+        GeyserPluginError, ReplicaAccountInfoV3, ReplicaBlockInfoV4, SlotStatus,
     },
     chrono::Utc,
     crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender},
@@ -18,16 +19,12 @@ use {
     postgres_client_block_metadata::DbBlockInfo,
     postgres_client_transaction::LogTransactionRequest,
     postgres_openssl::MakeTlsConnector,
-    solana_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPluginError, ReplicaAccountInfoV3, ReplicaBlockInfoV3, SlotStatus,
-    },
     solana_measure::measure::Measure,
     solana_metrics::*,
     solana_sdk::timing::AtomicInterval,
     std::{
-        collections::HashSet,
         sync::{
-            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         thread::{self, sleep, Builder, JoinHandle},
@@ -39,11 +36,10 @@ use {
 /// The maximum asynchronous requests allowed in the channel to avoid excessive
 /// memory usage. The downside -- calls after this threshold is reached can get blocked.
 const MAX_ASYNC_REQUESTS: usize = 40960;
-const SAFE_BATCH_STARTING_SLOT_CUSHION: u64 = 2 * 40960;
 const DEFAULT_POSTGRES_PORT: u16 = 5432;
 const DEFAULT_THREADS_COUNT: usize = 100;
 const DEFAULT_ACCOUNTS_INSERT_BATCH_SIZE: usize = 10;
-const ACCOUNT_COLUMN_COUNT: usize = 10;
+const ACCOUNT_COLUMN_COUNT: usize = 9;
 const DEFAULT_PANIC_ON_DB_ERROR: bool = false;
 const DEFAULT_STORE_ACCOUNT_HISTORICAL_DATA: bool = false;
 
@@ -56,20 +52,11 @@ struct PostgresSqlClientWrapper {
     update_transaction_log_stmt: Statement,
     update_block_metadata_stmt: Statement,
     insert_account_audit_stmt: Option<Statement>,
-    insert_token_owner_index_stmt: Option<Statement>,
-    insert_token_mint_index_stmt: Option<Statement>,
-    bulk_insert_token_owner_index_stmt: Option<Statement>,
-    bulk_insert_token_mint_index_stmt: Option<Statement>,
 }
 
 pub struct SimplePostgresClient {
     batch_size: usize,
-    slots_at_startup: HashSet<u64>,
     pending_account_updates: Vec<DbAccountInfo>,
-    index_token_owner: bool,
-    index_token_mint: bool,
-    pending_token_owner_index: Vec<TokenSecondaryIndexEntry>,
-    pending_token_mint_index: Vec<TokenSecondaryIndexEntry>,
     client: Mutex<PostgresSqlClientWrapper>,
 }
 
@@ -91,7 +78,6 @@ pub struct DbAccountInfo {
     pub data: Vec<u8>,
     pub slot: i64,
     pub write_version: i64,
-    pub txn_signature: Option<Vec<u8>>,
 }
 
 pub(crate) fn abort() -> ! {
@@ -112,14 +98,13 @@ impl DbAccountInfo {
         let data = account.data().to_vec();
         Self {
             pubkey: account.pubkey().to_vec(),
-            lamports: account.lamports(),
+            lamports: account.lamports() as i64,
             owner: account.owner().to_vec(),
             executable: account.executable(),
-            rent_epoch: account.rent_epoch(),
+            rent_epoch: account.rent_epoch() as i64,
             data,
             slot: slot as i64,
             write_version: account.write_version(),
-            txn_signature: account.txn_signature().map(|v| v.to_vec()),
         }
     }
 }
@@ -132,7 +117,6 @@ pub trait ReadableAccountInfo: Sized {
     fn rent_epoch(&self) -> i64;
     fn data(&self) -> &[u8];
     fn write_version(&self) -> i64;
-    fn txn_signature(&self) -> Option<&[u8]>;
 }
 
 impl ReadableAccountInfo for DbAccountInfo {
@@ -163,10 +147,6 @@ impl ReadableAccountInfo for DbAccountInfo {
     fn write_version(&self) -> i64 {
         self.write_version
     }
-
-    fn txn_signature(&self) -> Option<&[u8]> {
-        self.txn_signature.as_deref()
-    }
 }
 
 impl<'a> ReadableAccountInfo for ReplicaAccountInfoV3<'a> {
@@ -196,10 +176,6 @@ impl<'a> ReadableAccountInfo for ReplicaAccountInfoV3<'a> {
 
     fn write_version(&self) -> i64 {
         self.write_version as i64
-    }
-
-    fn txn_signature(&self) -> Option<&[u8]> {
-        self.txn.map(|v| v.signature().as_ref())
     }
 }
 
@@ -235,7 +211,9 @@ pub trait PostgresClient {
 }
 
 impl SimplePostgresClient {
-    pub fn connect_to_db(config: &GeyserPluginPostgresConfig) -> Result<Client, GeyserPluginError> {
+    pub fn connect_to_db(
+        config: &AccountsDbPluginPostgresConfig,
+    ) -> Result<Client, GeyserPluginError> {
         let port = config.port.unwrap_or(DEFAULT_POSTGRES_PORT);
 
         let connection_str = if let Some(connection_str) = &config.connection_str {
@@ -247,7 +225,7 @@ impl SimplePostgresClient {
                     config.connection_str, config.host, config.user
                 );
                 return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::ConfigurationError { msg },
+                    AccountsDbPluginPostgresError::ConfigurationError { msg },
                 )));
             }
             format!(
@@ -262,19 +240,19 @@ impl SimplePostgresClient {
             if config.server_ca.is_none() {
                 let msg = "\"server_ca\" must be specified when \"use_ssl\" is set".to_string();
                 return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::ConfigurationError { msg },
+                    AccountsDbPluginPostgresError::ConfigurationError { msg },
                 )));
             }
             if config.client_cert.is_none() {
                 let msg = "\"client_cert\" must be specified when \"use_ssl\" is set".to_string();
                 return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::ConfigurationError { msg },
+                    AccountsDbPluginPostgresError::ConfigurationError { msg },
                 )));
             }
             if config.client_key.is_none() {
                 let msg = "\"client_key\" must be specified when \"use_ssl\" is set".to_string();
                 return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::ConfigurationError { msg },
+                    AccountsDbPluginPostgresError::ConfigurationError { msg },
                 )));
             }
             let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
@@ -283,7 +261,7 @@ impl SimplePostgresClient {
                     "Failed to set the server certificate specified by \"server_ca\": {}. Error: ({})",
                     config.server_ca.as_ref().unwrap(), err);
                 return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::ConfigurationError { msg },
+                    AccountsDbPluginPostgresError::ConfigurationError { msg },
                 )));
             }
             if let Err(err) =
@@ -293,7 +271,7 @@ impl SimplePostgresClient {
                     "Failed to set the client certificate specified by \"client_cert\": {}. Error: ({})",
                     config.client_cert.as_ref().unwrap(), err);
                 return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::ConfigurationError { msg },
+                    AccountsDbPluginPostgresError::ConfigurationError { msg },
                 )));
             }
             if let Err(err) =
@@ -305,7 +283,7 @@ impl SimplePostgresClient {
                     err
                 );
                 return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::ConfigurationError { msg },
+                    AccountsDbPluginPostgresError::ConfigurationError { msg },
                 )));
             }
 
@@ -327,7 +305,7 @@ impl SimplePostgresClient {
                 );
                 error!("{}", msg);
                 Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::DataStoreConnectionError { msg },
+                    AccountsDbPluginPostgresError::DataStoreConnectionError { msg },
                 )))
             }
             Ok(client) => Ok(client),
@@ -336,16 +314,16 @@ impl SimplePostgresClient {
 
     fn build_bulk_account_insert_statement(
         client: &mut Client,
-        config: &GeyserPluginPostgresConfig,
+        config: &AccountsDbPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
         let batch_size = config
             .batch_size
             .unwrap_or(DEFAULT_ACCOUNTS_INSERT_BATCH_SIZE);
-        let mut stmt = String::from("INSERT INTO account AS acct (pubkey, slot, owner, lamports, executable, rent_epoch, data, write_version, updated_on, txn_signature) VALUES");
+        let mut stmt = String::from("INSERT INTO account AS acct (pubkey, slot, owner, lamports, executable, rent_epoch, data, write_version, updated_on) VALUES");
         for j in 0..batch_size {
             let row = j * ACCOUNT_COLUMN_COUNT;
             let val_str = format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 row + 1,
                 row + 2,
                 row + 3,
@@ -355,7 +333,6 @@ impl SimplePostgresClient {
                 row + 7,
                 row + 8,
                 row + 9,
-                row + 10,
             );
 
             if j == 0 {
@@ -366,7 +343,7 @@ impl SimplePostgresClient {
         }
 
         let handle_conflict = "ON CONFLICT (pubkey) DO UPDATE SET slot=excluded.slot, owner=excluded.owner, lamports=excluded.lamports, executable=excluded.executable, rent_epoch=excluded.rent_epoch, \
-            data=excluded.data, write_version=excluded.write_version, updated_on=excluded.updated_on, txn_signature=excluded.txn_signature WHERE acct.slot < excluded.slot OR (\
+            data=excluded.data, write_version=excluded.write_version, updated_on=excluded.updated_on WHERE acct.slot < excluded.slot OR (\
             acct.slot = excluded.slot AND acct.write_version < excluded.write_version)";
 
         stmt = format!("{} {}", stmt, handle_conflict);
@@ -376,12 +353,12 @@ impl SimplePostgresClient {
 
         match bulk_stmt {
             Err(err) => {
-                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                return Err(GeyserPluginError::Custom(Box::new(AccountsDbPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the accounts update PostgreSQL database: {} host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })))
+                })));
             }
             Ok(update_account_stmt) => Ok(update_account_stmt),
         }
@@ -389,66 +366,46 @@ impl SimplePostgresClient {
 
     fn build_single_account_upsert_statement(
         client: &mut Client,
-        config: &GeyserPluginPostgresConfig,
+        config: &AccountsDbPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
-        let stmt = "INSERT INTO account AS acct (pubkey, slot, owner, lamports, executable, rent_epoch, data, write_version, updated_on, txn_signature) \
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+        let stmt = "INSERT INTO account AS acct (pubkey, slot, owner, lamports, executable, rent_epoch, data, write_version, updated_on) \
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
         ON CONFLICT (pubkey) DO UPDATE SET slot=excluded.slot, owner=excluded.owner, lamports=excluded.lamports, executable=excluded.executable, rent_epoch=excluded.rent_epoch, \
-        data=excluded.data, write_version=excluded.write_version, updated_on=excluded.updated_on, txn_signature=excluded.txn_signature  WHERE acct.slot < excluded.slot OR (\
+        data=excluded.data, write_version=excluded.write_version, updated_on=excluded.updated_on  WHERE acct.slot < excluded.slot OR (\
         acct.slot = excluded.slot AND acct.write_version < excluded.write_version)";
 
         let stmt = client.prepare(stmt);
 
         match stmt {
             Err(err) => {
-                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                return Err(GeyserPluginError::Custom(Box::new(AccountsDbPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the accounts update PostgreSQL database: {} host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })))
+                })));
             }
             Ok(update_account_stmt) => Ok(update_account_stmt),
         }
     }
 
-    fn prepare_query_statement(
-        client: &mut Client,
-        config: &GeyserPluginPostgresConfig,
-        stmt: &str,
-    ) -> Result<Statement, GeyserPluginError> {
-        let statement = client.prepare(stmt);
-
-        match statement {
-            Err(err) => {
-                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
-                    msg: format!(
-                        "Error in preparing for the statement {} for PostgreSQL database: {} host: {:?} user: {:?} config: {:?}",
-                        stmt, err, config.host, config.user, config
-                    ),
-                })))
-            }
-            Ok(statement) => Ok(statement),
-        }
-    }
-
     fn build_account_audit_insert_statement(
         client: &mut Client,
-        config: &GeyserPluginPostgresConfig,
+        config: &AccountsDbPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
-        let stmt = "INSERT INTO account_audit (pubkey, slot, owner, lamports, executable, rent_epoch, data, write_version, updated_on, txn_signature) \
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+        let stmt = "INSERT INTO account_audit (pubkey, slot, owner, lamports, executable, rent_epoch, data, write_version, updated_on) \
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
 
         let stmt = client.prepare(stmt);
 
         match stmt {
             Err(err) => {
-                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                return Err(GeyserPluginError::Custom(Box::new(AccountsDbPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the account_audit update PostgreSQL database: {} host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })))
+                })));
             }
             Ok(stmt) => Ok(stmt),
         }
@@ -456,7 +413,7 @@ impl SimplePostgresClient {
 
     fn build_slot_upsert_statement_with_parent(
         client: &mut Client,
-        config: &GeyserPluginPostgresConfig,
+        config: &AccountsDbPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
         let stmt = "INSERT INTO slot (slot, parent, status, updated_on) \
         VALUES ($1, $2, $3, $4) \
@@ -466,12 +423,12 @@ impl SimplePostgresClient {
 
         match stmt {
             Err(err) => {
-                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                return Err(GeyserPluginError::Custom(Box::new(AccountsDbPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the slot update PostgreSQL database: {} host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })))
+                })));
             }
             Ok(stmt) => Ok(stmt),
         }
@@ -479,7 +436,7 @@ impl SimplePostgresClient {
 
     fn build_slot_upsert_statement_without_parent(
         client: &mut Client,
-        config: &GeyserPluginPostgresConfig,
+        config: &AccountsDbPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
         let stmt = "INSERT INTO slot (slot, status, updated_on) \
         VALUES ($1, $2, $3) \
@@ -489,12 +446,12 @@ impl SimplePostgresClient {
 
         match stmt {
             Err(err) => {
-                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                return Err(GeyserPluginError::Custom(Box::new(AccountsDbPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the slot update PostgreSQL database: {} host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })))
+                })));
             }
             Ok(stmt) => Ok(stmt),
         }
@@ -506,8 +463,8 @@ impl SimplePostgresClient {
         statement: &Statement,
         client: &mut Client,
     ) -> Result<(), GeyserPluginError> {
-        let lamports = account.lamports();
-        let rent_epoch = account.rent_epoch();
+        let lamports = account.lamports() as i64;
+        let rent_epoch = account.rent_epoch() as i64;
         let updated_on = Utc::now().naive_utc();
         let result = client.execute(
             statement,
@@ -521,7 +478,6 @@ impl SimplePostgresClient {
                 &account.data(),
                 &account.write_version(),
                 &updated_on,
-                &account.txn_signature(),
             ],
         );
 
@@ -542,11 +498,9 @@ impl SimplePostgresClient {
         statement: &Statement,
         client: &mut Client,
         insert_account_audit_stmt: &Option<Statement>,
-        insert_token_owner_index_stmt: &Option<Statement>,
-        insert_token_mint_index_stmt: &Option<Statement>,
     ) -> Result<(), GeyserPluginError> {
-        let lamports = account.lamports();
-        let rent_epoch = account.rent_epoch();
+        let lamports = account.lamports() as i64;
+        let rent_epoch = account.rent_epoch() as i64;
         let updated_on = Utc::now().naive_utc();
         let result = client.execute(
             statement,
@@ -560,7 +514,6 @@ impl SimplePostgresClient {
                 &account.data(),
                 &account.write_version(),
                 &updated_on,
-                &account.txn_signature(),
             ],
         );
 
@@ -578,14 +531,6 @@ impl SimplePostgresClient {
             Self::insert_account_audit(account, statement, client)?;
         }
 
-        if let Some(insert_token_owner_index_stmt) = insert_token_owner_index_stmt {
-            Self::update_token_owner_index(client, insert_token_owner_index_stmt, account)?;
-        }
-
-        if let Some(insert_token_mint_index_stmt) = insert_token_mint_index_stmt {
-            Self::update_token_mint_index(client, insert_token_mint_index_stmt, account)?;
-        }
-
         Ok(())
     }
 
@@ -594,19 +539,8 @@ impl SimplePostgresClient {
         let client = self.client.get_mut().unwrap();
         let insert_account_audit_stmt = &client.insert_account_audit_stmt;
         let statement = &client.update_account_stmt;
-        let insert_token_owner_index_stmt = &client.insert_token_owner_index_stmt;
-        let insert_token_mint_index_stmt = &client.insert_token_mint_index_stmt;
         let client = &mut client.client;
-        Self::upsert_account_internal(
-            account,
-            statement,
-            client,
-            insert_account_audit_stmt,
-            insert_token_owner_index_stmt,
-            insert_token_mint_index_stmt,
-        )?;
-
-        Ok(())
+        Self::upsert_account_internal(account, statement, client, insert_account_audit_stmt)
     }
 
     /// Insert accounts in batch to reduce network overhead
@@ -614,17 +548,10 @@ impl SimplePostgresClient {
         &mut self,
         account: DbAccountInfo,
     ) -> Result<(), GeyserPluginError> {
-        self.queue_secondary_indexes(&account);
         self.pending_account_updates.push(account);
 
-        self.bulk_insert_accounts()?;
-        self.bulk_insert_token_owner_index()?;
-        self.bulk_insert_token_mint_index()
-    }
-
-    fn bulk_insert_accounts(&mut self) -> Result<(), GeyserPluginError> {
         if self.pending_account_updates.len() == self.batch_size {
-            let mut measure = Measure::start("geyser-plugin-postgres-prepare-values");
+            let mut measure = Measure::start("accountsdb-plugin-postgres-prepare-values");
 
             let mut values: Vec<&(dyn types::ToSql + Sync)> =
                 Vec::with_capacity(self.batch_size * ACCOUNT_COLUMN_COUNT);
@@ -641,24 +568,22 @@ impl SimplePostgresClient {
                 values.push(&account.data);
                 values.push(&account.write_version);
                 values.push(&updated_on);
-                values.push(&account.txn_signature);
             }
             measure.stop();
             inc_new_counter_debug!(
-                "geyser-plugin-postgres-prepare-values-us",
+                "accountsdb-plugin-postgres-prepare-values-us",
                 measure.as_us() as usize,
                 10000,
                 10000
             );
 
-            let mut measure = Measure::start("geyser-plugin-postgres-update-account");
+            let mut measure = Measure::start("accountsdb-plugin-postgres-update-account");
             let client = self.client.get_mut().unwrap();
             let result = client
                 .client
                 .query(&client.bulk_account_insert_stmt, &values);
 
             self.pending_account_updates.clear();
-
             if let Err(err) = result {
                 let msg = format!(
                     "Failed to persist the update of account to the PostgreSQL database. Error: {:?}",
@@ -667,16 +592,15 @@ impl SimplePostgresClient {
                 error!("{}", msg);
                 return Err(GeyserPluginError::AccountsUpdateError { msg });
             }
-
             measure.stop();
             inc_new_counter_debug!(
-                "geyser-plugin-postgres-update-account-us",
+                "accountsdb-plugin-postgres-update-account-us",
                 measure.as_us() as usize,
                 10000,
                 10000
             );
             inc_new_counter_debug!(
-                "geyser-plugin-postgres-update-account-count",
+                "accountsdb-plugin-postgres-update-account-count",
                 self.batch_size,
                 10000,
                 10000
@@ -687,84 +611,23 @@ impl SimplePostgresClient {
 
     /// Flush any left over accounts in batch which are not processed in the last batch
     fn flush_buffered_writes(&mut self) -> Result<(), GeyserPluginError> {
+        if self.pending_account_updates.is_empty() {
+            return Ok(());
+        }
+
         let client = self.client.get_mut().unwrap();
         let insert_account_audit_stmt = &client.insert_account_audit_stmt;
         let statement = &client.update_account_stmt;
-        let insert_token_owner_index_stmt = &client.insert_token_owner_index_stmt;
-        let insert_token_mint_index_stmt = &client.insert_token_mint_index_stmt;
-        let insert_slot_stmt = &client.update_slot_without_parent_stmt;
         let client = &mut client.client;
 
         for account in self.pending_account_updates.drain(..) {
-            Self::upsert_account_internal(
-                &account,
-                statement,
-                client,
-                insert_account_audit_stmt,
-                insert_token_owner_index_stmt,
-                insert_token_mint_index_stmt,
-            )?;
-        }
-
-        let mut measure = Measure::start("geyser-plugin-postgres-flush-slots-us");
-
-        for slot in &self.slots_at_startup {
-            Self::upsert_slot_status_internal(
-                *slot,
-                None,
-                SlotStatus::Rooted,
-                client,
-                insert_slot_stmt,
-            )?;
-        }
-        measure.stop();
-
-        datapoint_info!(
-            "geyser_plugin_notify_account_restore_from_snapshot_summary",
-            ("flush_slots-us", measure.as_us(), i64),
-            ("flush-slots-counts", self.slots_at_startup.len(), i64),
-        );
-
-        self.slots_at_startup.clear();
-        self.clear_buffered_indexes();
-        Ok(())
-    }
-
-    fn upsert_slot_status_internal(
-        slot: u64,
-        parent: Option<u64>,
-        status: SlotStatus,
-        client: &mut Client,
-        statement: &Statement,
-    ) -> Result<(), GeyserPluginError> {
-        let slot = slot as i64; // postgres only supports i64
-        let parent = parent.map(|parent| parent as i64);
-        let updated_on = Utc::now().naive_utc();
-        let status_str = status.as_str();
-
-        let result = match parent {
-            Some(parent) => client.execute(statement, &[&slot, &parent, &status_str, &updated_on]),
-            None => client.execute(statement, &[&slot, &status_str, &updated_on]),
-        };
-
-        match result {
-            Err(err) => {
-                let msg = format!(
-                    "Failed to persist the update of slot to the PostgreSQL database. Error: {:?}",
-                    err
-                );
-                error!("{:?}", msg);
-                return Err(GeyserPluginError::SlotStatusUpdateError { msg });
-            }
-            Ok(rows) => {
-                assert_eq!(1, rows, "Expected one rows to be updated a time");
-            }
+            Self::upsert_account_internal(&account, statement, client, insert_account_audit_stmt)?;
         }
 
         Ok(())
     }
 
-    pub fn new(config: &GeyserPluginPostgresConfig) -> Result<Self, GeyserPluginError> {
+    pub fn new(config: &AccountsDbPluginPostgresConfig) -> Result<Self, GeyserPluginError> {
         info!("Creating SimplePostgresClient...");
         let mut client = Self::connect_to_db(config)?;
         let bulk_account_insert_stmt =
@@ -795,38 +658,6 @@ impl SimplePostgresClient {
             None
         };
 
-        let bulk_insert_token_owner_index_stmt = if let Some(true) = config.index_token_owner {
-            let stmt = Self::build_bulk_token_owner_index_insert_statement(&mut client, config)?;
-            Some(stmt)
-        } else {
-            None
-        };
-
-        let bulk_insert_token_mint_index_stmt = if let Some(true) = config.index_token_mint {
-            let stmt = Self::build_bulk_token_mint_index_insert_statement(&mut client, config)?;
-            Some(stmt)
-        } else {
-            None
-        };
-
-        let insert_token_owner_index_stmt = if let Some(true) = config.index_token_owner {
-            Some(Self::build_single_token_owner_index_upsert_statement(
-                &mut client,
-                config,
-            )?)
-        } else {
-            None
-        };
-
-        let insert_token_mint_index_stmt = if let Some(true) = config.index_token_mint {
-            Some(Self::build_single_token_mint_index_upsert_statement(
-                &mut client,
-                config,
-            )?)
-        } else {
-            None
-        };
-
         info!("Created SimplePostgresClient.");
         Ok(Self {
             batch_size,
@@ -840,41 +671,8 @@ impl SimplePostgresClient {
                 update_transaction_log_stmt,
                 update_block_metadata_stmt,
                 insert_account_audit_stmt,
-                insert_token_owner_index_stmt,
-                insert_token_mint_index_stmt,
-                bulk_insert_token_owner_index_stmt,
-                bulk_insert_token_mint_index_stmt,
             }),
-            index_token_owner: config.index_token_owner.unwrap_or_default(),
-            index_token_mint: config.index_token_mint.unwrap_or(false),
-            pending_token_owner_index: Vec::with_capacity(batch_size),
-            pending_token_mint_index: Vec::with_capacity(batch_size),
-            slots_at_startup: HashSet::default(),
         })
-    }
-
-    fn get_highest_available_slot(&mut self) -> Result<u64, GeyserPluginError> {
-        let client = self.client.get_mut().unwrap();
-
-        let last_slot_query = "SELECT slot FROM slot ORDER BY slot DESC LIMIT 1;";
-
-        let result = client.client.query_opt(last_slot_query, &[]);
-        match result {
-            Ok(opt_slot) => Ok(opt_slot
-                .map(|row| {
-                    let raw_slot: i64 = row.get(0);
-                    raw_slot as u64
-                })
-                .unwrap_or(0)),
-            Err(err) => {
-                let msg = format!(
-                    "Failed to receive last slot from PostgreSQL database. Error: {:?}",
-                    err
-                );
-                error!("{}", msg);
-                Err(GeyserPluginError::AccountsUpdateError { msg })
-            }
-        }
     }
 }
 
@@ -893,8 +691,6 @@ impl PostgresClient for SimplePostgresClient {
         if !is_startup {
             return self.upsert_account(&account);
         }
-
-        self.slots_at_startup.insert(account.slot as u64);
         self.insert_accounts_in_batch(account)
     }
 
@@ -906,14 +702,38 @@ impl PostgresClient for SimplePostgresClient {
     ) -> Result<(), GeyserPluginError> {
         info!("Updating slot {:?} at with status {:?}", slot, status);
 
+        let slot = slot as i64; // postgres only supports i64
+        let parent = parent.map(|parent| parent as i64);
+        let updated_on = Utc::now().naive_utc();
+        let status_str = status.as_str();
         let client = self.client.get_mut().unwrap();
 
-        let statement = match parent {
-            Some(_) => &client.update_slot_with_parent_stmt,
-            None => &client.update_slot_without_parent_stmt,
+        let result = match parent {
+            Some(parent) => client.client.execute(
+                &client.update_slot_with_parent_stmt,
+                &[&slot, &parent, &status_str, &updated_on],
+            ),
+            None => client.client.execute(
+                &client.update_slot_without_parent_stmt,
+                &[&slot, &status_str, &updated_on],
+            ),
         };
 
-        Self::upsert_slot_status_internal(slot, parent, status, &mut client.client, statement)
+        match result {
+            Err(err) => {
+                let msg = format!(
+                    "Failed to persist the update of slot to the PostgreSQL database. Error: {:?}",
+                    err
+                );
+                error!("{:?}", msg);
+                return Err(GeyserPluginError::SlotStatusUpdateError { msg });
+            }
+            Ok(rows) => {
+                assert_eq!(1, rows, "Expected one rows to be updated a time");
+            }
+        }
+
+        Ok(())
     }
 
     fn notify_end_of_startup(&mut self) -> Result<(), GeyserPluginError> {
@@ -959,7 +779,7 @@ enum DbWorkItem {
 }
 
 impl PostgresClientWorker {
-    fn new(config: GeyserPluginPostgresConfig) -> Result<Self, GeyserPluginError> {
+    fn new(config: AccountsDbPluginPostgresConfig) -> Result<Self, GeyserPluginError> {
         let result = SimplePostgresClient::new(&config);
         match result {
             Ok(client) => Ok(PostgresClientWorker {
@@ -982,11 +802,11 @@ impl PostgresClientWorker {
         panic_on_db_errors: bool,
     ) -> Result<(), GeyserPluginError> {
         while !exit_worker.load(Ordering::Relaxed) {
-            let mut measure = Measure::start("geyser-plugin-postgres-worker-recv");
+            let mut measure = Measure::start("accountsdb-plugin-postgres-worker-recv");
             let work = receiver.recv_timeout(Duration::from_millis(500));
             measure.stop();
             inc_new_counter_debug!(
-                "geyser-plugin-postgres-worker-recv-us",
+                "accountsdb-plugin-postgres-worker-recv-us",
                 measure.as_us() as usize,
                 100000,
                 100000
@@ -1069,11 +889,10 @@ pub struct ParallelPostgresClient {
     initialized_worker_count: Arc<AtomicUsize>,
     sender: Sender<DbWorkItem>,
     last_report: AtomicInterval,
-    transaction_write_version: AtomicU64,
 }
 
 impl ParallelPostgresClient {
-    pub fn new(config: &GeyserPluginPostgresConfig) -> Result<Self, GeyserPluginError> {
+    pub fn new(config: &AccountsDbPluginPostgresConfig) -> Result<Self, GeyserPluginError> {
         info!("Creating ParallelPostgresClient...");
         let (sender, receiver) = bounded(MAX_ASYNC_REQUESTS);
         let exit_worker = Arc::new(AtomicBool::new(false));
@@ -1133,7 +952,6 @@ impl ParallelPostgresClient {
             startup_done_count,
             initialized_worker_count,
             sender,
-            transaction_write_version: AtomicU64::default(),
         })
     }
 
@@ -1160,18 +978,13 @@ impl ParallelPostgresClient {
         slot: u64,
         is_startup: bool,
     ) -> Result<(), GeyserPluginError> {
-        if !is_startup && account.txn.is_none() {
-            // we are not interested in accountsdb internal bookeeping updates
-            return Ok(());
-        }
-
         if self.last_report.should_update(30000) {
             datapoint_debug!(
                 "postgres-plugin-stats",
                 ("message-queue-length", self.sender.len() as i64, i64),
             );
         }
-        let mut measure = Measure::start("geyser-plugin-posgres-create-work-item");
+        let mut measure = Measure::start("accountsdb-plugin-posgres-create-work-item");
         let wrk_item = DbWorkItem::UpdateAccount(Box::new(UpdateAccountRequest {
             account: DbAccountInfo::new(account, slot),
             is_startup,
@@ -1180,13 +993,13 @@ impl ParallelPostgresClient {
         measure.stop();
 
         inc_new_counter_debug!(
-            "geyser-plugin-posgres-create-work-item-us",
+            "accountsdb-plugin-posgres-create-work-item-us",
             measure.as_us() as usize,
             100000,
             100000
         );
 
-        let mut measure = Measure::start("geyser-plugin-posgres-send-msg");
+        let mut measure = Measure::start("accountsdb-plugin-posgres-send-msg");
 
         if let Err(err) = self.sender.send(wrk_item) {
             return Err(GeyserPluginError::AccountsUpdateError {
@@ -1200,7 +1013,7 @@ impl ParallelPostgresClient {
 
         measure.stop();
         inc_new_counter_debug!(
-            "geyser-plugin-posgres-send-msg-us",
+            "accountsdb-plugin-posgres-send-msg-us",
             measure.as_us() as usize,
             100000,
             100000
@@ -1232,7 +1045,7 @@ impl ParallelPostgresClient {
 
     pub fn update_block_metadata(
         &self,
-        block_info: &ReplicaBlockInfoV3,
+        block_info: &ReplicaBlockInfoV4,
     ) -> Result<(), GeyserPluginError> {
         if let Err(err) = self.sender.send(DbWorkItem::UpdateBlockMetadata(Box::new(
             UpdateBlockMetadataRequest {
@@ -1278,27 +1091,14 @@ pub struct PostgresClientBuilder {}
 
 impl PostgresClientBuilder {
     pub fn build_pararallel_postgres_client(
-        config: &GeyserPluginPostgresConfig,
-    ) -> Result<(ParallelPostgresClient, Option<u64>), GeyserPluginError> {
-        let batch_optimize_by_skiping_older_slots =
-            match config.skip_upsert_existing_accounts_at_startup {
-                true => {
-                    let mut on_load_client = SimplePostgresClient::new(config)?;
+        config: &AccountsDbPluginPostgresConfig,
+    ) -> Result<ParallelPostgresClient, GeyserPluginError> {
+        ParallelPostgresClient::new(config)
+    }
 
-                    // database if populated concurrently so we need to move some number of slots
-                    // below highest available slot to make sure we do not skip anything that was already in DB.
-                    let batch_slot_bound = on_load_client
-                        .get_highest_available_slot()?
-                        .saturating_sub(SAFE_BATCH_STARTING_SLOT_CUSHION);
-                    info!(
-                        "Set batch_optimize_by_skiping_older_slots to {}",
-                        batch_slot_bound
-                    );
-                    Some(batch_slot_bound)
-                }
-                false => None,
-            };
-
-        ParallelPostgresClient::new(config).map(|v| (v, batch_optimize_by_skiping_older_slots))
+    pub fn build_simple_postgres_client(
+        config: &AccountsDbPluginPostgresConfig,
+    ) -> Result<SimplePostgresClient, GeyserPluginError> {
+        SimplePostgresClient::new(config)
     }
 }

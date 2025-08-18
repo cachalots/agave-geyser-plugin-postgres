@@ -1,16 +1,18 @@
 use {
     crate::{
-        geyser_plugin_postgres::{GeyserPluginPostgresConfig, GeyserPluginPostgresError},
+        accountsdb_plugin_postgres::{
+            AccountsDbPluginPostgresConfig, AccountsDbPluginPostgresError,
+        },
         postgres_client::{
             postgres_client_transaction::DbReward, SimplePostgresClient, UpdateBlockMetadataRequest,
         },
     },
+    agave_geyser_plugin_interface::geyser_plugin_interface::{
+        GeyserPluginError, ReplicaBlockInfoV4,
+    },
     chrono::Utc,
     log::*,
     postgres::{Client, Statement},
-    solana_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPluginError, ReplicaBlockInfoV3,
-    },
 };
 
 #[derive(Clone, Debug)]
@@ -22,12 +24,17 @@ pub struct DbBlockInfo {
     pub block_height: Option<i64>,
 }
 
-impl<'a> From<&ReplicaBlockInfoV3<'a>> for DbBlockInfo {
-    fn from(block_info: &ReplicaBlockInfoV3) -> Self {
+impl<'a> From<&ReplicaBlockInfoV4<'a>> for DbBlockInfo {
+    fn from(block_info: &ReplicaBlockInfoV4) -> Self {
         Self {
             slot: block_info.slot as i64,
             blockhash: block_info.blockhash.to_string(),
-            rewards: block_info.rewards.iter().map(DbReward::from).collect(),
+            rewards: block_info
+                .rewards
+                .rewards
+                .iter()
+                .map(DbReward::from)
+                .collect(),
             block_time: block_info.block_time,
             block_height: block_info
                 .block_height
@@ -39,24 +46,22 @@ impl<'a> From<&ReplicaBlockInfoV3<'a>> for DbBlockInfo {
 impl SimplePostgresClient {
     pub(crate) fn build_block_metadata_upsert_statement(
         client: &mut Client,
-        config: &GeyserPluginPostgresConfig,
+        config: &AccountsDbPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
         let stmt =
             "INSERT INTO block (slot, blockhash, rewards, block_time, block_height, updated_on) \
-        VALUES ($1, $2, $3, $4, $5, $6) \
-        ON CONFLICT (slot) DO UPDATE SET blockhash=excluded.blockhash, rewards=excluded.rewards, \
-        block_time=excluded.block_time, block_height=excluded.block_height, updated_on=excluded.updated_on";
+        VALUES ($1, $2, $3, $4, $5, $6)";
 
         let stmt = client.prepare(stmt);
 
         match stmt {
             Err(err) => {
-                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                return Err(GeyserPluginError::Custom(Box::new(AccountsDbPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the block metadata update PostgreSQL database: ({}) host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })))
+                })));
             }
             Ok(stmt) => Ok(stmt),
         }

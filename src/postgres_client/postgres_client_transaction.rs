@@ -2,16 +2,18 @@
 /// database.
 use {
     crate::{
-        geyser_plugin_postgres::{GeyserPluginPostgresConfig, GeyserPluginPostgresError},
+        accountsdb_plugin_postgres::{
+            AccountsDbPluginPostgresConfig, AccountsDbPluginPostgresError,
+        },
         postgres_client::{DbWorkItem, ParallelPostgresClient, SimplePostgresClient},
+    },
+    agave_geyser_plugin_interface::geyser_plugin_interface::{
+        GeyserPluginError, ReplicaTransactionInfoV2,
     },
     chrono::Utc,
     log::*,
     postgres::{Client, Statement},
     postgres_types::{FromSql, ToSql},
-    solana_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPluginError, ReplicaTransactionInfoV2,
-    },
     solana_runtime::bank::RewardType,
     solana_sdk::{
         instruction::CompiledInstruction,
@@ -24,7 +26,6 @@ use {
     solana_transaction_status::{
         InnerInstructions, Reward, TransactionStatusMeta, TransactionTokenBalance,
     },
-    std::sync::atomic::Ordering,
 };
 
 const MAX_TRANSACTION_STATUS_LEN: usize = 256;
@@ -53,7 +54,7 @@ pub struct DbTransactionTokenBalance {
     pub owner: String,
 }
 
-#[derive(Clone, Debug, Eq, FromSql, ToSql, PartialEq)]
+#[derive(Clone, Debug, FromSql, ToSql, PartialEq)]
 #[postgres(name = "RewardType")]
 pub enum DbRewardType {
     Fee,
@@ -145,11 +146,6 @@ pub struct DbTransaction {
     pub message_hash: Vec<u8>,
     pub meta: DbTransactionStatusMeta,
     pub signatures: Vec<Vec<u8>>,
-    /// This can be used to tell the order of transaction within a block
-    /// Given a slot, the transaction with a smaller write_version appears
-    /// before transactions with higher write_versions in a shred.
-    pub write_version: i64,
-    pub index: i64,
 }
 
 pub struct LogTransactionRequest {
@@ -258,13 +254,11 @@ impl From<&v0::Message> for DbTransactionMessageV0 {
     }
 }
 
-impl<'a> From<&v0::LoadedMessage<'a>> for DbLoadedMessageV0 {
+impl From<&v0::LoadedMessage<'_>> for DbLoadedMessageV0 {
     fn from(message: &v0::LoadedMessage) -> Self {
         Self {
-            message: DbTransactionMessageV0::from(&message.message as &v0::Message),
-            loaded_addresses: DbLoadedAddresses::from(
-                &message.loaded_addresses as &LoadedAddresses,
-            ),
+            message: DbTransactionMessageV0::from(message.message.as_ref()),
+            loaded_addresses: DbLoadedAddresses::from(message.loaded_addresses.as_ref()),
         }
     }
 }
@@ -301,7 +295,7 @@ impl From<&Reward> for DbReward {
     fn from(reward: &Reward) -> Self {
         Self {
             pubkey: reward.pubkey.clone(),
-            lamports: reward.lamports,
+            lamports: reward.lamports as i64,
             post_balance: reward.post_balance as i64,
             reward_type: get_reward_type(&reward.reward_type),
             commission: reward
@@ -312,7 +306,7 @@ impl From<&Reward> for DbReward {
     }
 }
 
-#[derive(Clone, Debug, Eq, FromSql, ToSql, PartialEq)]
+#[derive(Clone, Debug, FromSql, ToSql, PartialEq)]
 #[postgres(name = "TransactionErrorCode")]
 pub enum DbTransactionErrorCode {
     AccountInUse,
@@ -336,7 +330,6 @@ pub enum DbTransactionErrorCode {
     WouldExceedMaxBlockCostLimit,
     UnsupportedVersion,
     InvalidWritableAccount,
-    WouldExceedMaxAccountDataCostLimit,
     TooManyAccountLocks,
     AddressLookupTableNotFound,
     InvalidAddressLookupTableOwner,
@@ -351,8 +344,10 @@ pub enum DbTransactionErrorCode {
     MaxLoadedAccountsDataSizeExceeded,
     InvalidLoadedAccountsDataSizeLimit,
     ResanitizationNeeded,
-    UnbalancedTransaction,
     ProgramExecutionTemporarilyRestricted,
+    UnbalancedTransaction,
+    ProgramCacheHitMaxLimit,
+    CommitCancelled,
 }
 
 impl From<&TransactionError> for DbTransactionErrorCode {
@@ -376,48 +371,50 @@ impl From<&TransactionError> for DbTransactionErrorCode {
             TransactionError::ClusterMaintenance => Self::ClusterMaintenance,
             TransactionError::AccountBorrowOutstanding => Self::AccountBorrowOutstanding,
             TransactionError::WouldExceedMaxAccountCostLimit => {
-                Self::WouldExceedMaxAccountCostLimit
-            }
+                        Self::WouldExceedMaxAccountCostLimit
+                    }
             TransactionError::WouldExceedMaxBlockCostLimit => Self::WouldExceedMaxBlockCostLimit,
             TransactionError::UnsupportedVersion => Self::UnsupportedVersion,
             TransactionError::InvalidWritableAccount => Self::InvalidWritableAccount,
-            TransactionError::WouldExceedAccountDataBlockLimit => {
-                Self::WouldExceedAccountDataBlockLimit
-            }
-            TransactionError::WouldExceedAccountDataTotalLimit => {
-                Self::WouldExceedAccountDataTotalLimit
-            }
             TransactionError::TooManyAccountLocks => Self::TooManyAccountLocks,
             TransactionError::AddressLookupTableNotFound => Self::AddressLookupTableNotFound,
             TransactionError::InvalidAddressLookupTableOwner => {
-                Self::InvalidAddressLookupTableOwner
-            }
+                        Self::InvalidAddressLookupTableOwner
+                    }
             TransactionError::InvalidAddressLookupTableData => Self::InvalidAddressLookupTableData,
             TransactionError::InvalidAddressLookupTableIndex => {
-                Self::InvalidAddressLookupTableIndex
-            }
+                        Self::InvalidAddressLookupTableIndex
+                    }
             TransactionError::InvalidRentPayingAccount => Self::InvalidRentPayingAccount,
             TransactionError::WouldExceedMaxVoteCostLimit => Self::WouldExceedMaxVoteCostLimit,
+            TransactionError::WouldExceedAccountDataBlockLimit => {
+                        Self::WouldExceedAccountDataBlockLimit
+                    }
+            TransactionError::WouldExceedAccountDataTotalLimit => {
+                        Self::WouldExceedAccountDataTotalLimit
+                    }
             TransactionError::DuplicateInstruction(_) => Self::DuplicateInstruction,
             TransactionError::InsufficientFundsForRent { account_index: _ } => {
-                Self::InsufficientFundsForRent
-            }
+                        Self::InsufficientFundsForRent
+                    }
             TransactionError::MaxLoadedAccountsDataSizeExceeded => {
-                Self::MaxLoadedAccountsDataSizeExceeded
-            }
+                        Self::MaxLoadedAccountsDataSizeExceeded
+                    }
             TransactionError::InvalidLoadedAccountsDataSizeLimit => {
-                Self::InvalidLoadedAccountsDataSizeLimit
-            }
+                        Self::InvalidLoadedAccountsDataSizeLimit
+                    }
             TransactionError::ResanitizationNeeded => Self::ResanitizationNeeded,
-            TransactionError::UnbalancedTransaction => Self::UnbalancedTransaction,
             TransactionError::ProgramExecutionTemporarilyRestricted { account_index: _ } => {
-                Self::ProgramExecutionTemporarilyRestricted
-            }
+                        Self::ProgramExecutionTemporarilyRestricted
+                    }
+            TransactionError::UnbalancedTransaction => Self::UnbalancedTransaction,
+            TransactionError::ProgramCacheHitMaxLimit => Self::ProgramCacheHitMaxLimit,
+            TransactionError::CommitCancelled => Self::CommitCancelled,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, FromSql, ToSql, PartialEq)]
+#[derive(Clone, Debug, FromSql, ToSql, PartialEq)]
 #[postgres(name = "TransactionError")]
 pub struct DbTransactionError {
     error_code: DbTransactionErrorCode,
@@ -502,11 +499,7 @@ impl From<&TransactionStatusMeta> for DbTransactionStatusMeta {
     }
 }
 
-fn build_db_transaction(
-    slot: u64,
-    transaction_info: &ReplicaTransactionInfoV2,
-    transaction_write_version: u64,
-) -> DbTransaction {
+fn build_db_transaction(slot: u64, transaction_info: &ReplicaTransactionInfoV2) -> DbTransaction {
     DbTransaction {
         signature: transaction_info.signature.as_ref().to_vec(),
         is_vote: transaction_info.is_vote,
@@ -537,19 +530,17 @@ fn build_db_transaction(
             .as_ref()
             .to_vec(),
         meta: DbTransactionStatusMeta::from(transaction_info.transaction_status_meta),
-        write_version: transaction_write_version as i64,
-        index: transaction_info.index as i64,
     }
 }
 
 impl SimplePostgresClient {
     pub(crate) fn build_transaction_info_upsert_statement(
         client: &mut Client,
-        config: &GeyserPluginPostgresConfig,
+        config: &AccountsDbPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
         let stmt = "INSERT INTO transaction AS txn (signature, is_vote, slot, message_type, legacy_message, \
-        v0_loaded_message, signatures, message_hash, meta, write_version, index, updated_on) \
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+        v0_loaded_message, signatures, message_hash, meta, updated_on) \
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
         ON CONFLICT (slot, signature) DO UPDATE SET is_vote=excluded.is_vote, \
         message_type=excluded.message_type, \
         legacy_message=excluded.legacy_message, \
@@ -557,20 +548,18 @@ impl SimplePostgresClient {
         signatures=excluded.signatures, \
         message_hash=excluded.message_hash, \
         meta=excluded.meta, \
-        write_version=excluded.write_version, \
-        index=excluded.index,
         updated_on=excluded.updated_on";
 
         let stmt = client.prepare(stmt);
 
         match stmt {
             Err(err) => {
-                Err(GeyserPluginError::Custom(Box::new(GeyserPluginPostgresError::DataSchemaError {
+                return Err(GeyserPluginError::Custom(Box::new(AccountsDbPluginPostgresError::DataSchemaError {
                     msg: format!(
                         "Error in preparing for the transaction update PostgreSQL database: ({}) host: {:?} user: {:?} config: {:?}",
                         err, config.host, config.user, config
                     ),
-                })))
+                })));
             }
             Ok(stmt) => Ok(stmt),
         }
@@ -598,16 +587,14 @@ impl SimplePostgresClient {
                 &transaction_info.signatures,
                 &transaction_info.message_hash,
                 &transaction_info.meta,
-                &transaction_info.write_version,
-                &transaction_info.index,
                 &updated_on,
             ],
         );
 
         if let Err(err) = result {
             let msg = format!(
-                "Failed to persist the update of transaction info to the PostgreSQL database. Error: {:?}",
-                err
+                "Failed to persist the update of transaction info to the PostgreSQL database. Error: {:?} meta: {:?}",
+                err, transaction_info.meta
             );
             error!("{}", msg);
             return Err(GeyserPluginError::AccountsUpdateError { msg });
@@ -621,14 +608,9 @@ impl ParallelPostgresClient {
     fn build_transaction_request(
         slot: u64,
         transaction_info: &ReplicaTransactionInfoV2,
-        transaction_write_version: u64,
     ) -> LogTransactionRequest {
         LogTransactionRequest {
-            transaction_info: build_db_transaction(
-                slot,
-                transaction_info,
-                transaction_write_version,
-            ),
+            transaction_info: build_db_transaction(slot, transaction_info),
         }
     }
 
@@ -637,12 +619,9 @@ impl ParallelPostgresClient {
         transaction_info: &ReplicaTransactionInfoV2,
         slot: u64,
     ) -> Result<(), GeyserPluginError> {
-        self.transaction_write_version
-            .fetch_add(1, Ordering::Relaxed);
         let wrk_item = DbWorkItem::LogTransaction(Box::new(Self::build_transaction_request(
             slot,
             transaction_info,
-            self.transaction_write_version.load(Ordering::Relaxed),
         )));
 
         if let Err(err) = self.sender.send(wrk_item) {
@@ -658,18 +637,19 @@ impl ParallelPostgresClient {
 pub(crate) mod tests {
     use {
         super::*,
+        agave_reserved_account_keys::ReservedAccountKeys,
         solana_account_decoder::parse_token::UiTokenAmount,
         solana_sdk::{
             hash::Hash,
-            message::VersionedMessage,
+            message::{SimpleAddressLoader, VersionedMessage},
             pubkey::Pubkey,
             signature::{Keypair, Signature, Signer},
-            system_transaction,
-            transaction::{
-                SanitizedTransaction, SimpleAddressLoader, Transaction, VersionedTransaction,
-            },
+            transaction::{SanitizedTransaction, Transaction, VersionedTransaction},
+            transaction_context::TransactionReturnData,
         },
+        solana_system_transaction,
         solana_transaction_status::InnerInstruction,
+        std::borrow::Cow,
     };
 
     fn check_compiled_instruction_equality(
@@ -698,7 +678,7 @@ pub(crate) mod tests {
         for i in 0..compiled_instruction.data.len() {
             assert_eq!(
                 compiled_instruction.data[i],
-                db_compiled_instruction.data[i]
+                db_compiled_instruction.data[i] as u8
             )
         }
     }
@@ -863,7 +843,7 @@ pub(crate) mod tests {
                 ui_amount_string: "0.42".to_string(),
             },
             owner: Pubkey::new_unique().to_string(),
-            program_id: "program_id".to_string(),
+            program_id: "123".to_string(),
         };
 
         let db_transaction_token_balance =
@@ -1049,7 +1029,7 @@ pub(crate) mod tests {
                         ui_amount_string: "0.42".to_string(),
                     },
                     owner: Pubkey::new_unique().to_string(),
-                    program_id: "program_id".to_string(),
+                    program_id: "123".to_string(),
                 },
                 TransactionTokenBalance {
                     account_index: 2,
@@ -1061,7 +1041,7 @@ pub(crate) mod tests {
                         ui_amount_string: "0.38".to_string(),
                     },
                     owner: Pubkey::new_unique().to_string(),
-                    program_id: "program_id".to_string(),
+                    program_id: "123".to_string(),
                 },
             ]),
             post_token_balances: Some(vec![
@@ -1075,7 +1055,7 @@ pub(crate) mod tests {
                         ui_amount_string: "0.82".to_string(),
                     },
                     owner: Pubkey::new_unique().to_string(),
-                    program_id: "program_id".to_string(),
+                    program_id: "123".to_string(),
                 },
                 TransactionTokenBalance {
                     account_index: 2,
@@ -1087,7 +1067,7 @@ pub(crate) mod tests {
                         ui_amount_string: "0.48".to_string(),
                     },
                     owner: Pubkey::new_unique().to_string(),
-                    program_id: "program_id".to_string(),
+                    program_id: "123".to_string(),
                 },
             ]),
             rewards: Some(vec![
@@ -1106,12 +1086,13 @@ pub(crate) mod tests {
                     commission: Some(11),
                 },
             ]),
-            loaded_addresses: LoadedAddresses {
-                writable: vec![Pubkey::new_unique(), Pubkey::new_unique()],
-                readonly: vec![Pubkey::new_unique(), Pubkey::new_unique()],
-            },
-            return_data: None,
-            compute_units_consumed: None,
+            loaded_addresses: LoadedAddresses::default(),
+            return_data: Some(TransactionReturnData {
+                program_id: Pubkey::new_from_array([2u8; 32]),
+                data: vec![1, 2, 3],
+            }),
+            compute_units_consumed: Some(1234u64),
+            cost_units: None,
         }
     }
 
@@ -1314,13 +1295,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_transform_loaded_message_v0() {
-        let message = v0::LoadedMessage::new(
-            build_transaction_message_v0(),
-            LoadedAddresses {
+        let message = v0::LoadedMessage {
+            message: Cow::Owned(build_transaction_message_v0()),
+            loaded_addresses: Cow::Owned(LoadedAddresses {
                 writable: vec![Pubkey::new_unique(), Pubkey::new_unique()],
                 readonly: vec![Pubkey::new_unique(), Pubkey::new_unique()],
-            },
-        );
+            }),
+            is_writable_account_cache: Vec::default(),
+        };
 
         let db_message = DbLoadedMessageV0::from(&message);
         check_loaded_message_v0_equality(&message, &db_message);
@@ -1338,7 +1320,7 @@ pub(crate) mod tests {
             SanitizedMessage::Legacy(message) => {
                 assert_eq!(db_transaction.message_type, 0);
                 check_transaction_message_equality(
-                    &message.message,
+                    message.message.as_ref(),
                     db_transaction.legacy_message.as_ref().unwrap(),
                 );
             }
@@ -1375,12 +1357,12 @@ pub(crate) mod tests {
         let keypair1 = Keypair::new();
         let pubkey1 = keypair1.pubkey();
         let zero = Hash::default();
-        system_transaction::transfer(&keypair1, &pubkey1, 42, zero)
+        solana_system_transaction::transfer(&keypair1, &pubkey1, 42, zero)
     }
 
     #[test]
     fn test_build_db_transaction_legacy() {
-        let signature = Signature::from([1u8; 64]);
+        let signature = Signature::new_unique();
 
         let message_hash = Hash::new_unique();
         let transaction = build_test_transaction_legacy();
@@ -1392,6 +1374,7 @@ pub(crate) mod tests {
             message_hash,
             Some(true),
             SimpleAddressLoader::Disabled,
+            &ReservedAccountKeys::empty_key_set(),
         )
         .unwrap();
 
@@ -1405,16 +1388,16 @@ pub(crate) mod tests {
         };
 
         let slot = 54;
-        let db_transaction = build_db_transaction(slot, &transaction_info, 1);
+        let db_transaction = build_db_transaction(slot, &transaction_info);
         check_transaction(slot, &transaction_info, &db_transaction);
     }
 
     fn build_test_transaction_v0() -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![
-                Signature::from([1u8; 64]),
-                Signature::from([2u8; 64]),
-                Signature::from([3u8; 64]),
+                Signature::new_unique(),
+                Signature::new_unique(),
+                Signature::new_unique(),
             ],
             message: VersionedMessage::V0(build_transaction_message_v0()),
         }
@@ -1422,7 +1405,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_build_db_transaction_v0() {
-        let signature = Signature::from([1u8; 64]);
+        let signature = Signature::new_unique();
 
         let message_hash = Hash::new_unique();
         let transaction = build_test_transaction_v0();
@@ -1437,6 +1420,7 @@ pub(crate) mod tests {
                 writable: vec![Pubkey::new_unique(), Pubkey::new_unique()],
                 readonly: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             }),
+            &ReservedAccountKeys::empty_key_set(),
         )
         .unwrap();
 
@@ -1450,7 +1434,7 @@ pub(crate) mod tests {
         };
 
         let slot = 54;
-        let db_transaction = build_db_transaction(slot, &transaction_info, 1);
+        let db_transaction = build_db_transaction(slot, &transaction_info);
         check_transaction(slot, &transaction_info, &db_transaction);
     }
 }
