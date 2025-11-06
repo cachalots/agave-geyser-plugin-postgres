@@ -26,6 +26,7 @@ use {
     solana_transaction_status::{
         InnerInstructions, Reward, TransactionStatusMeta, TransactionTokenBalance,
     },
+    bs58,
 };
 
 const MAX_TRANSACTION_STATUS_LEN: usize = 256;
@@ -145,6 +146,7 @@ pub struct DbTransaction {
     pub v0_loaded_message: Option<DbLoadedMessageV0>,
     pub message_hash: Vec<u8>,
     pub meta: DbTransactionStatusMeta,
+    pub index: i64,
     pub signatures: Vec<Vec<u8>>,
 }
 
@@ -504,6 +506,7 @@ fn build_db_transaction(slot: u64, transaction_info: &ReplicaTransactionInfoV2) 
         signature: transaction_info.signature.as_ref().to_vec(),
         is_vote: transaction_info.is_vote,
         slot: slot as i64,
+        index: transaction_info.index as i64,
         message_type: match transaction_info.transaction.message() {
             SanitizedMessage::Legacy(_) => 0,
             SanitizedMessage::V0(_) => 1,
@@ -538,9 +541,9 @@ impl SimplePostgresClient {
         client: &mut Client,
         config: &AccountsDbPluginPostgresConfig,
     ) -> Result<Statement, GeyserPluginError> {
-        let stmt = "INSERT INTO transaction AS txn (signature, is_vote, slot, message_type, legacy_message, \
+        let stmt = "INSERT INTO transaction AS txn (index, failed, signer, signature, is_vote, slot, message_type, legacy_message, \
         v0_loaded_message, signatures, message_hash, meta, updated_on) \
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
         ON CONFLICT (slot, signature) DO UPDATE SET is_vote=excluded.is_vote, \
         message_type=excluded.message_type, \
         legacy_message=excluded.legacy_message, \
@@ -575,9 +578,35 @@ impl SimplePostgresClient {
         let updated_on = Utc::now().naive_utc();
 
         let transaction_info = transaction_log_info.transaction_info;
+        let signer = if transaction_info.legacy_message.is_some() {
+            let legacy_message = transaction_info.legacy_message.as_ref().unwrap();
+            if !legacy_message.account_keys.is_empty() {
+                Some(legacy_message.account_keys[0].clone())
+            } else {
+                None
+            }
+        } else if transaction_info.v0_loaded_message.is_some() {
+            let v0_loaded_message = transaction_info.v0_loaded_message.as_ref().unwrap();
+            if !v0_loaded_message.message.account_keys.is_empty() {
+                Some(v0_loaded_message.message.account_keys[0].clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let signer: String = match signer {
+            // base58 encoded pubkey of the signer
+            Some(signer_bytes) => bs58::encode(signer_bytes).into_string(),
+            None => String::new(),
+        };
+        let failed = transaction_info.meta.error.is_some();
         let result = client.query(
             statement,
             &[
+                &transaction_info.index,
+                &failed,
+                &signer,
                 &transaction_info.signature,
                 &transaction_info.is_vote,
                 &transaction_info.slot,
