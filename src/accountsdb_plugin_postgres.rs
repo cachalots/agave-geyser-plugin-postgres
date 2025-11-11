@@ -7,7 +7,8 @@ use {
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
-        ReplicaTransactionInfoVersions, Result, SlotStatus,
+        ReplicaTransactionInfoV2, ReplicaTransactionInfoV3, ReplicaTransactionInfoVersions, Result,
+        SlotStatus,
     },
     bs58,
     log::*,
@@ -15,7 +16,9 @@ use {
     serde_json,
     solana_measure::measure::Measure,
     solana_metrics::*,
-    std::{fs::File, io::Read},
+    solana_sdk::{message::SimpleAddressLoader, transaction::SanitizedTransaction},
+    solana_transaction::versioned::sanitized::SanitizedVersionedTransaction,
+    std::{collections::HashSet, fs::File, io::Read},
     thiserror::Error,
 };
 
@@ -254,7 +257,12 @@ impl GeyserPlugin for AccountsDbPluginPostgres {
         Ok(())
     }
 
-    fn update_slot_status(&self, slot: u64, parent: Option<u64>, status: &SlotStatus) -> Result<()> {
+    fn update_slot_status(
+        &self,
+        slot: u64,
+        parent: Option<u64>,
+        status: &SlotStatus,
+    ) -> Result<()> {
         info!("Updating slot {:?} at with status {:?}", slot, status);
 
         match &self.client {
@@ -334,6 +342,37 @@ impl GeyserPlugin for AccountsDbPluginPostgres {
                     }
 
                     let result = client.log_transaction_info(transaction_info, slot);
+
+                    if let Err(err) = result {
+                        return Err(GeyserPluginError::SlotStatusUpdateError{
+                                msg: format!("Failed to persist the transaction info to the PostgreSQL database. Error: {:?}", err)
+                            });
+                    }
+                }
+
+                ReplicaTransactionInfoVersions::V0_0_3(transaction_info) => {
+                    let sanitized_transaction = Self::sanitize_v3_transaction(transaction_info)?;
+
+                    if let Some(transaction_selector) = &self.transaction_selector {
+                        if !transaction_selector.is_transaction_selected(
+                            transaction_info.is_vote,
+                            Box::new(sanitized_transaction.message().account_keys().iter()),
+                        ) {
+                            return Ok(());
+                        }
+                    } else {
+                        return Ok(());
+                    }
+
+                    let converted_transaction_info = ReplicaTransactionInfoV2 {
+                        signature: transaction_info.signature,
+                        is_vote: transaction_info.is_vote,
+                        transaction: &sanitized_transaction,
+                        transaction_status_meta: transaction_info.transaction_status_meta,
+                        index: transaction_info.index,
+                    };
+
+                    let result = client.log_transaction_info(&converted_transaction_info, slot);
 
                     if let Err(err) = result {
                         return Err(GeyserPluginError::SlotStatusUpdateError{
@@ -451,6 +490,42 @@ impl AccountsDbPluginPostgres {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn sanitize_v3_transaction(
+        transaction_info: &ReplicaTransactionInfoV3,
+    ) -> std::result::Result<SanitizedTransaction, GeyserPluginError> {
+        let sanitized_versioned_transaction = SanitizedVersionedTransaction::try_from(
+            transaction_info.transaction.clone(),
+        )
+        .map_err(|err| GeyserPluginError::SlotStatusUpdateError {
+            msg: format!(
+                "Failed to sanitize versioned transaction for storage: {:?}",
+                err
+            ),
+        })?;
+
+        let address_loader = SimpleAddressLoader::Enabled(
+            transaction_info
+                .transaction_status_meta
+                .loaded_addresses
+                .clone(),
+        );
+        let reserved_account_keys = HashSet::new();
+
+        SanitizedTransaction::try_new(
+            sanitized_versioned_transaction,
+            *transaction_info.message_hash,
+            transaction_info.is_vote,
+            address_loader,
+            &reserved_account_keys,
+        )
+        .map_err(|err| GeyserPluginError::SlotStatusUpdateError {
+            msg: format!(
+                "Failed to convert ReplicaTransactionInfoV3 into sanitized transaction: {:?}",
+                err
+            ),
+        })
+    }
 }
 
 #[no_mangle]
@@ -466,7 +541,24 @@ pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use {super::*, serde_json};
+    use {
+        super::*,
+        agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoV3,
+        serde_json,
+        solana_sdk::{
+            hash::Hash,
+            message::{
+                compiled_instruction::CompiledInstruction,
+                v0::{self, LoadedAddresses, MessageAddressTableLookup},
+                MessageHeader, SanitizedMessage, VersionedMessage,
+            },
+            pubkey::Pubkey,
+            signature::{Keypair, Signature, Signer},
+            transaction::VersionedTransaction,
+        },
+        solana_system_transaction,
+        solana_transaction_status::TransactionStatusMeta,
+    };
 
     #[test]
     fn test_accounts_selector_from_config() {
@@ -476,5 +568,107 @@ pub(crate) mod tests {
 
         let config: serde_json::Value = serde_json::from_str(config).unwrap();
         AccountsDbPluginPostgres::create_accounts_selector_from_config(&config);
+    }
+
+    #[test]
+    fn test_sanitize_v3_transaction_legacy() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let legacy_transaction =
+            solana_system_transaction::transfer(&payer, &recipient, 1, Hash::new_unique());
+        let versioned_transaction = VersionedTransaction::from(legacy_transaction);
+        let signature = versioned_transaction.signatures.first().unwrap().clone();
+        let message_hash = Hash::new_unique();
+        let transaction_status_meta = TransactionStatusMeta::default();
+
+        let replica_transaction_info = ReplicaTransactionInfoV3 {
+            signature: &signature,
+            message_hash: &message_hash,
+            is_vote: false,
+            transaction: &versioned_transaction,
+            transaction_status_meta: &transaction_status_meta,
+            index: 0,
+        };
+
+        let sanitized =
+            AccountsDbPluginPostgres::sanitize_v3_transaction(&replica_transaction_info).unwrap();
+        assert!(matches!(sanitized.message(), SanitizedMessage::Legacy(_)));
+        assert_eq!(sanitized.message_hash(), &message_hash);
+        assert_eq!(
+            sanitized.signatures(),
+            versioned_transaction.signatures.as_slice()
+        );
+        assert!(!sanitized.is_simple_vote_transaction());
+    }
+
+    fn build_v0_transaction() -> (VersionedTransaction, LoadedAddresses) {
+        let payer = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        let lookup_table = Pubkey::new_unique();
+        let loaded_addresses = LoadedAddresses {
+            writable: vec![Pubkey::new_unique()],
+            readonly: vec![],
+        };
+
+        let message = v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![payer, program],
+            recent_blockhash: Hash::new_unique(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0, 2],
+                data: vec![1, 2, 3],
+            }],
+            address_table_lookups: vec![MessageAddressTableLookup {
+                account_key: lookup_table,
+                writable_indexes: vec![0],
+                readonly_indexes: vec![],
+            }],
+        };
+
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::new_unique()],
+            message: VersionedMessage::V0(message),
+        };
+
+        (transaction, loaded_addresses)
+    }
+
+    #[test]
+    fn test_sanitize_v3_transaction_v0() {
+        let (versioned_transaction, loaded_addresses) = build_v0_transaction();
+        let signature = versioned_transaction.signatures.first().unwrap().clone();
+        let message_hash = Hash::new_unique();
+        let mut transaction_status_meta = TransactionStatusMeta::default();
+        transaction_status_meta.loaded_addresses = loaded_addresses.clone();
+
+        let replica_transaction_info = ReplicaTransactionInfoV3 {
+            signature: &signature,
+            message_hash: &message_hash,
+            is_vote: true,
+            transaction: &versioned_transaction,
+            transaction_status_meta: &transaction_status_meta,
+            index: 12,
+        };
+
+        let sanitized =
+            AccountsDbPluginPostgres::sanitize_v3_transaction(&replica_transaction_info).unwrap();
+        assert!(sanitized.is_simple_vote_transaction());
+        assert!(matches!(sanitized.message(), SanitizedMessage::V0(_)));
+
+        if let SanitizedMessage::V0(loaded_message) = sanitized.message() {
+            assert_eq!(
+                loaded_message.loaded_addresses.writable,
+                loaded_addresses.writable
+            );
+            assert_eq!(
+                loaded_message.loaded_addresses.readonly,
+                loaded_addresses.readonly
+            );
+        }
     }
 }

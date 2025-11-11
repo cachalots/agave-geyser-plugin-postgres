@@ -10,14 +10,15 @@ use {
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPluginError, ReplicaTransactionInfoV2,
     },
+    bs58,
     chrono::Utc,
     log::*,
     postgres::{Client, Statement},
     postgres_types::{FromSql, ToSql},
     solana_runtime::bank::RewardType,
     solana_sdk::{
-        instruction::CompiledInstruction,
         message::{
+            compiled_instruction::CompiledInstruction,
             v0::{self, LoadedAddresses, MessageAddressTableLookup},
             Message, MessageHeader, SanitizedMessage,
         },
@@ -26,7 +27,6 @@ use {
     solana_transaction_status::{
         InnerInstructions, Reward, TransactionStatusMeta, TransactionTokenBalance,
     },
-    bs58,
 };
 
 const MAX_TRANSACTION_STATUS_LEN: usize = 256;
@@ -373,42 +373,42 @@ impl From<&TransactionError> for DbTransactionErrorCode {
             TransactionError::ClusterMaintenance => Self::ClusterMaintenance,
             TransactionError::AccountBorrowOutstanding => Self::AccountBorrowOutstanding,
             TransactionError::WouldExceedMaxAccountCostLimit => {
-                        Self::WouldExceedMaxAccountCostLimit
-                    }
+                Self::WouldExceedMaxAccountCostLimit
+            }
             TransactionError::WouldExceedMaxBlockCostLimit => Self::WouldExceedMaxBlockCostLimit,
             TransactionError::UnsupportedVersion => Self::UnsupportedVersion,
             TransactionError::InvalidWritableAccount => Self::InvalidWritableAccount,
             TransactionError::TooManyAccountLocks => Self::TooManyAccountLocks,
             TransactionError::AddressLookupTableNotFound => Self::AddressLookupTableNotFound,
             TransactionError::InvalidAddressLookupTableOwner => {
-                        Self::InvalidAddressLookupTableOwner
-                    }
+                Self::InvalidAddressLookupTableOwner
+            }
             TransactionError::InvalidAddressLookupTableData => Self::InvalidAddressLookupTableData,
             TransactionError::InvalidAddressLookupTableIndex => {
-                        Self::InvalidAddressLookupTableIndex
-                    }
+                Self::InvalidAddressLookupTableIndex
+            }
             TransactionError::InvalidRentPayingAccount => Self::InvalidRentPayingAccount,
             TransactionError::WouldExceedMaxVoteCostLimit => Self::WouldExceedMaxVoteCostLimit,
             TransactionError::WouldExceedAccountDataBlockLimit => {
-                        Self::WouldExceedAccountDataBlockLimit
-                    }
+                Self::WouldExceedAccountDataBlockLimit
+            }
             TransactionError::WouldExceedAccountDataTotalLimit => {
-                        Self::WouldExceedAccountDataTotalLimit
-                    }
+                Self::WouldExceedAccountDataTotalLimit
+            }
             TransactionError::DuplicateInstruction(_) => Self::DuplicateInstruction,
             TransactionError::InsufficientFundsForRent { account_index: _ } => {
-                        Self::InsufficientFundsForRent
-                    }
+                Self::InsufficientFundsForRent
+            }
             TransactionError::MaxLoadedAccountsDataSizeExceeded => {
-                        Self::MaxLoadedAccountsDataSizeExceeded
-                    }
+                Self::MaxLoadedAccountsDataSizeExceeded
+            }
             TransactionError::InvalidLoadedAccountsDataSizeLimit => {
-                        Self::InvalidLoadedAccountsDataSizeLimit
-                    }
+                Self::InvalidLoadedAccountsDataSizeLimit
+            }
             TransactionError::ResanitizationNeeded => Self::ResanitizationNeeded,
             TransactionError::ProgramExecutionTemporarilyRestricted { account_index: _ } => {
-                        Self::ProgramExecutionTemporarilyRestricted
-                    }
+                Self::ProgramExecutionTemporarilyRestricted
+            }
             TransactionError::UnbalancedTransaction => Self::UnbalancedTransaction,
             TransactionError::ProgramCacheHitMaxLimit => Self::ProgramCacheHitMaxLimit,
             TransactionError::CommitCancelled => Self::CommitCancelled,

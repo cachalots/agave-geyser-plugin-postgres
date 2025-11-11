@@ -13,7 +13,7 @@ documentation = "https://docs.rs/solana-validator"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-agave-geyser-plugin-interface = { version = "2.3.6" }
+agave-geyser-plugin-interface = { version = "3.0.6" }
 bs58 = "0.4.0"
 chrono = { version = "0.4.11", features = ["serde"] }
 crossbeam-channel = "0.5"
@@ -25,33 +25,34 @@ postgres-openssl = { version = "0.5.0"}
 serde = "1.0.133"
 serde_derive = "1.0.103"
 serde_json = "1.0.74"
-solana-account-decoder = { version = "2.3.6" }
+solana-account-decoder = { version = "3.0.6" }
 
-solana-logger = { version = "2.3.1" }
-solana-measure = { version = "2.3.6" }
-solana-metrics = { version = "2.3.6" }
-solana-runtime = { version = "2.3.6" }
-solana-program = { version = "2.3.0" }
-solana-zk-token-sdk = { version = "2.3.6" } 
-solana-sdk = { version = "2.3.1" }
-solana-transaction-status = { version = "2.3.6" }
+solana-logger = { version = "3.0.0" }
+solana-measure = { version = "3.0.6" }
+solana-metrics = { version = "3.0.6" }
+solana-runtime = { version = "3.0.6" }
+solana-program = { version = "3.0.0" }
+solana-zk-token-sdk = { version = "3.0.6" } 
+solana-sdk = { version = "3.0.0" }
+solana-transaction = { version = "3.0.0" }
+solana-transaction-status = { version = "3.0.6" }
 
 
 thiserror = "1.0.64"
 tokio-postgres = "0.7.12"
 
 [dev-dependencies]
-agave-reserved-account-keys = { version = "2.3.6" }
+agave-reserved-account-keys = { version = "3.0.6" }
 libc = "0.2.112"
 libloading = "0.7.2"
 serial_test = "0.5.1"
-solana-account-decoder = { version = "2.3.6" }
-solana-core = { version = "2.3.6" }
-solana-local-cluster = { version = "2.3.6" }
-solana-net-utils = { version = "2.3.6" }
-solana-rpc = { version = "2.3.6" }
-solana-streamer = { version = "2.3.6" }
-solana-system-transaction = { version = "2.2.1" } 
+solana-account-decoder = { version = "3.0.6" }
+solana-core = { version = "3.0.6" }
+solana-local-cluster = { version = "3.0.6" }
+solana-net-utils = { version = "3.0.6" }
+solana-rpc = { version = "3.0.6" }
+solana-streamer = { version = "3.0.6" }
+solana-system-transaction = { version = "3.0.0" }
 tempfile = "3.13.0"
 
 [package.metadata.docs.rs]
@@ -61,7 +62,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 #[patch.crates-io]
 #curve25519-dalek = { git = "https://github.com/anza-xyz/curve25519-dalek.git", rev = "b500cdc2a920cd5bff9e2dd974d7b97349d61464" }
 
-#solana-curve25519 = { version = "2.3.6" }
-#solana-program = { version = "2.3.6" }
-#solana-zk-sdk = { version = "2.3.6" }
-#solana-zk-token-sdk = { version = "2.3.6" }
+#solana-curve25519 = { version = "3.0.6" }
+#solana-program = { version = "3.0.6" }
+#solana-zk-sdk = { version = "3.0.6" }
+#solana-zk-token-sdk = { version = "3.0.6" }
