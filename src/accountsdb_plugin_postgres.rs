@@ -16,7 +16,11 @@ use {
     serde_json,
     solana_measure::measure::Measure,
     solana_metrics::*,
-    solana_sdk::{message::SimpleAddressLoader, transaction::SanitizedTransaction},
+    solana_sdk::{
+        message::{SimpleAddressLoader, VersionedMessage},
+        pubkey::Pubkey,
+        transaction::SanitizedTransaction,
+    },
     solana_transaction::versioned::sanitized::SanitizedVersionedTransaction,
     std::{collections::HashSet, fs::File, io::Read},
     thiserror::Error,
@@ -351,18 +355,18 @@ impl GeyserPlugin for AccountsDbPluginPostgres {
                 }
 
                 ReplicaTransactionInfoVersions::V0_0_3(transaction_info) => {
-                    let sanitized_transaction = Self::sanitize_v3_transaction(transaction_info)?;
-
                     if let Some(transaction_selector) = &self.transaction_selector {
                         if !transaction_selector.is_transaction_selected(
                             transaction_info.is_vote,
-                            Box::new(sanitized_transaction.message().account_keys().iter()),
+                            Self::v3_transaction_account_keys(transaction_info),
                         ) {
                             return Ok(());
                         }
                     } else {
                         return Ok(());
                     }
+
+                    let sanitized_transaction = Self::sanitize_v3_transaction(transaction_info)?;
 
                     let converted_transaction_info = ReplicaTransactionInfoV2 {
                         signature: transaction_info.signature,
@@ -526,6 +530,24 @@ impl AccountsDbPluginPostgres {
             ),
         })
     }
+
+    fn v3_transaction_account_keys<'a>(
+        transaction_info: &'a ReplicaTransactionInfoV3,
+    ) -> Box<dyn Iterator<Item = &'a Pubkey> + 'a> {
+        match &transaction_info.transaction.message {
+            VersionedMessage::Legacy(message) => Box::new(message.account_keys.iter()),
+            VersionedMessage::V0(message) => {
+                let loaded_addresses = &transaction_info.transaction_status_meta.loaded_addresses;
+                Box::new(
+                    message
+                        .account_keys
+                        .iter()
+                        .chain(loaded_addresses.writable.iter())
+                        .chain(loaded_addresses.readonly.iter()),
+                )
+            }
+        }
+    }
 }
 
 #[no_mangle]
@@ -540,7 +562,7 @@ pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+    pub(crate) mod tests {
     use {
         super::*,
         agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoV3,
@@ -669,6 +691,74 @@ pub(crate) mod tests {
                 loaded_message.loaded_addresses.readonly,
                 loaded_addresses.readonly
             );
+        }
+    }
+
+    #[test]
+    fn test_v3_transaction_account_keys_legacy() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let legacy_transaction =
+            solana_system_transaction::transfer(&payer, &recipient, 1, Hash::new_unique());
+        let versioned_transaction = VersionedTransaction::from(legacy_transaction);
+        let signature = versioned_transaction.signatures.first().unwrap().clone();
+        let message_hash = Hash::new_unique();
+        let transaction_status_meta = TransactionStatusMeta::default();
+
+        let replica_transaction_info = ReplicaTransactionInfoV3 {
+            signature: &signature,
+            message_hash: &message_hash,
+            is_vote: false,
+            transaction: &versioned_transaction,
+            transaction_status_meta: &transaction_status_meta,
+            index: 0,
+        };
+
+        let collected: Vec<Pubkey> = AccountsDbPluginPostgres::v3_transaction_account_keys(
+            &replica_transaction_info,
+        )
+        .map(|pubkey| *pubkey)
+        .collect();
+
+        match &versioned_transaction.message {
+            VersionedMessage::Legacy(message) => {
+                assert_eq!(collected, message.account_keys);
+            }
+            _ => panic!("unexpected message type"),
+        }
+    }
+
+    #[test]
+    fn test_v3_transaction_account_keys_v0() {
+        let (versioned_transaction, loaded_addresses) = build_v0_transaction();
+        let signature = versioned_transaction.signatures.first().unwrap().clone();
+        let message_hash = Hash::new_unique();
+        let mut transaction_status_meta = TransactionStatusMeta::default();
+        transaction_status_meta.loaded_addresses = loaded_addresses.clone();
+
+        let replica_transaction_info = ReplicaTransactionInfoV3 {
+            signature: &signature,
+            message_hash: &message_hash,
+            is_vote: true,
+            transaction: &versioned_transaction,
+            transaction_status_meta: &transaction_status_meta,
+            index: 12,
+        };
+
+        let collected: Vec<Pubkey> = AccountsDbPluginPostgres::v3_transaction_account_keys(
+            &replica_transaction_info,
+        )
+        .map(|pubkey| *pubkey)
+        .collect();
+
+        match &versioned_transaction.message {
+            VersionedMessage::V0(message) => {
+                let mut expected = message.account_keys.clone();
+                expected.extend(loaded_addresses.writable);
+                expected.extend(loaded_addresses.readonly);
+                assert_eq!(collected, expected);
+            }
+            _ => panic!("unexpected message type"),
         }
     }
 }
